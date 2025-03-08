@@ -358,8 +358,6 @@ pheatmap(
 With the gene expression for different tissues and models, perform a PCA on the data and visualize the results (PC1 and PC2, and also, PC3 ). Label the points in the plot with their respective tissues/models. 
 
 ```{r}
-data <- readRDS("Data/join_tpm_filtered.rds")
-write.csv(data, "join_tpm_filtered.csv", row.names = TRUE)
 
 ```
 
