@@ -1,0 +1,398 @@
+---
+title: "Hands-on 2 DMI"
+author: "Dummy Surname (dummy@mail.com)"
+date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
+output:
+  html_document:
+    toc: true
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Clustering
+
+## **Optional exercise** 
+
+Follow the tutorial from the [clustering section](https://genomicsclass.github.io/book/pages/clustering_and_heatmaps.html) of the book [PH525x series - Biomedical Data Science](http://genomicsclass.github.io/book/). 
+
+Install the package [tissuesGeneExpression](https://github.com/genomicsclass/tissuesGeneExpression) by running in R: 
+
+```{r, eval=F}
+library(devtools)
+install_github("genomicsclass/tissuesGeneExpression")
+```
+
+## Clustering gene expression data in healthy tissues
+
+The aim of the exercise is to find out if the samples belonging to different tissues in different species cluster together by species or by tissue. To answer this: 
+
+* Download the [data](https://www.ebi.ac.uk/biostudies/arrayexpress/studies/E-MTAB-6081) (design and tpm files) corresponding to the publication [An RNASeq normal tissue atlas for mouse and rat](https://www.nature.com/articles/sdata2017185).   
+* Download the [gene expression data](https://storage.googleapis.com/adult-gtex/bulk-gex/v10/rna-seq/GTEx_Analysis_v10_RNASeQCv2.4.2_gene_median_tpm.gct.gz) corresponding to the publication  [The Genotype-Tissue Expression (GTEx) pilot analysis: multitissue gene regulation in humans](https://www.science.org/doi/10.1126/science.1262110) from  the [GTEX portal](https://gtexportal.org/home/datasets)    
+
+From the three datasets, keep only tissues belonging to the following categories:  
+
+
+```{r}
+## Data cleaning and preparation: to cluster based on gene expression data, we first need to make sure that the rat, mouse and human datasets are cleaned and combined in the right format before clustering.
+install.packages("biomaRt")  # Install biomaRt if not installed
+library(dplyr)
+library(tibble)
+library(biomaRt)
+
+tissues <-  c( "brain", "colon",  "duodenum",  "esophagus" , "heart",   "ileum",   "jejunum", "kidney",  "liver",   "pancreas",  "quadriceps" , "stomach", "thymus" )
+
+# Read the rat, mouse and human tables
+table_rat <- read.table("data/E-MTAB-6081/rat_tpm.txt", sep= "\t", header=TRUE)
+# Move row names (gene IDs) to an ordinary column and introduce a progressive ID to check correctly for duplicate rows. Otherwise, all rows with identical measurements will be marked as duplicates even if they have different gene IDs. Do the same for the mouse table
+table_rat <- table_rat %>% rownames_to_column(var = "Gene_ID")
+
+table_mouse <- read.table("data/E-MTAB-6081/mouse_tpm.txt", sep= "\t", header=TRUE)
+table_mouse <- table_mouse %>% rownames_to_column(var = "Gene_ID")
+
+# Read the table for human samples
+table_human <- read.delim("data/GTEx_Analysis_v10_RNASeQCv2.4.2_gene_median_tpm.gct/GTEx_Analysis_2022-06-06_v10_RNASeQCv2.4.2_gene_median_tpm.gct", skip = 2, header = TRUE)
+
+# Remove the decimal part in an Ensembl Gene ID to ensure consistency across tables
+table_human$Name <- sub("\\..*", "", table_human$Name)
+
+# Check for duplicates in the three tables
+any(duplicated(table_rat))      # returns FALSE
+any(duplicated(table_mouse))    # returns FALSE
+any(duplicated(table_human))    # returns TRUE
+
+# Create a new data frame with all duplicated rows in table_human
+duplicates_human_all <- table_human[duplicated(table_human$Name) | duplicated(table_human$Name, fromLast = TRUE), ]
+# When exploring a few examples, we notice that there is usually a row with entries different from 0 and a row with all entries equal to 0 for a duplicate gene
+
+# Remove rows where all values (except the "Name" column) are 0 in table_human, to filter out biologically irrelevant genes and since genes with all zeros across tissues do not provide any meaningful information for clustering
+table_human_filtered <- table_human %>%
+  filter(rowSums(across(where(is.numeric))) > 0)  # Keep rows where at least one value is greater than 0
+#Check for duplicates again
+any(duplicated(table_human_filtered))    # returns FALSE
+
+# Prepare human data for joining later. First, rename "Name" column
+colnames(table_human_filtered)[1] <- "gene"
+# Delete gene column, use description as gene name. When multiple genes have the same description, keep the one with the maximum expression
+human_filtered <- table_human_filtered %>%
+  dplyr::select(-gene) %>%
+  dplyr::rename(gene = Description) %>%
+  group_by(gene) %>%
+  summarise(across(everything(), max)) %>% 
+  ungroup()
+
+# Convert column names to lowercase
+colnames(human_filtered) <- tolower(colnames(human_filtered))
+
+# Convert gene column to lowercase
+human_filtered$gene <- tolower(human_filtered$gene)
+# Make sure there are no duplicates
+any(duplicated(human_filtered$gene))   # this returns FALSE
+
+# Similarly, remove rows with all zeros in table_mouse and table_rat
+table_mouse_filtered <- table_mouse %>%
+  filter(rowSums(across(where(is.numeric))) > 0)
+table_rat_filtered <- table_rat %>%
+  filter(rowSums(across(where(is.numeric))) > 0)
+```
+Now that we prepared the data, we proceed to match the Gene IDs for mouse, rat and human using Biomart
+```{r}
+## Preparation steps to join the three tables
+# Connect to Ensembl Biomart (Mouse dataset)
+mouse_mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+# Obtain Ensembl Gene IDs and their corresponding external gene names
+mouse_gene_mapping <- getBM(
+  attributes = c("ensembl_gene_id", "external_gene_name"),
+  mart = mouse_mart
+)
+saveRDS(mouse_gene_mapping, file = "mouse_gene_mapping.rds")
+
+# Remove empty names to avoid issues later on
+mouse_gene_mapping <- mouse_gene_mapping[mouse_gene_mapping$external_gene_name != "", ]
+
+# Merge table_mouse_filtered with the mouse_gene_mapping data
+mouse_external_names <-left_join(table_mouse_filtered, mouse_gene_mapping, by = c("Gene_ID" = "ensembl_gene_id"))
+
+# Rename the column external_gene_name to Gene
+mouse_external_names <- mouse_external_names %>%
+  rename(Gene = external_gene_name)
+# Remove the original Gene_ID column
+mouse_external_names <- mouse_external_names[, !names(mouse_external_names) %in% "Gene_ID"]
+# If multiple rows exist for the same gene, merge them by keeping the highest expression values per column
+mouse_external_names <- aggregate(. ~ Gene, data = mouse_external_names, FUN = max)
+
+# Add an identifier for mouse genes that will be later used, transform to lowercase
+mouse_external_names <- mouse_external_names %>%
+  rename_with(~ gsub("X199_", "X199_mouse_", .x) %>% tolower())
+# As the tip in the hands-on suggested, converting all column names to lower case
+mouse_external_names$gene <- tolower(mouse_external_names$gene) 
+# Check for duplicate rows
+any(duplicated(mouse_external_names$gene))   # this returns FALSE
+
+## Next, we do the same steps for rat
+
+# Connect to Ensembl Biomart to get the rat gene name mapping
+rat_mart <- useMart("ensembl", dataset = "rnorvegicus_gene_ensembl")
+rat_gene_mapping <- getBM(
+  attributes = c("ensembl_gene_id", "external_gene_name"),
+  mart = rat_mart
+)
+saveRDS(rat_gene_mapping, file = "rat_gene_mapping.rds")
+rat_gene_mapping <- rat_gene_mapping[rat_gene_mapping$external_gene_name != "", ]
+
+# Merge data
+rat_external_names <-left_join(table_rat_filtered, rat_gene_mapping, by = c("Gene_ID" = "ensembl_gene_id"))
+rat_external_names <- rat_external_names %>%
+  rename(Gene = external_gene_name)
+rat_external_names <- rat_external_names[, !names(rat_external_names) %in% "Gene_ID"]
+
+# If multiple rows exist for the same gene, merge them as done for mouse
+rat_external_names <- aggregate(. ~ Gene, data = rat_external_names, FUN = max)   
+
+# Add an identifier for mouse genes that will be later used
+colnames(rat_external_names) <- gsub("X199_","X199_rat_", colnames(rat_external_names)) %>% tolower()
+# As the tip in the hands-on suggested, converting all column names to lower case
+rat_external_names$gene <- tolower(rat_external_names$gene) 
+
+any(duplicated(rat_external_names$gene))   # this returns FALSE
+```
+Next step is to join the three tables
+```{r}
+
+# Join the tables
+join_table <- human_filtered %>% 
+  inner_join(mouse_external_names, by = "gene") %>% 
+  inner_join(rat_external_names, by = "gene")
+
+any(duplicated(join_table$gene))   # this returns FALSE
+
+saveRDS(join_table, file = "join_table_v1.rds")
+
+join_table_2 <- join_table %>% 
+  #dplyr::select(gene, contains(tissues)) %>%
+  column_to_rownames("gene") %>%  
+  t()
+
+# Create a regex pattern
+pattern <- paste(tissues, collapse = "|")
+
+# Filter rows where row names contain any of the tissue names
+join_table_3 <- join_table_2[grep(pattern, rownames(join_table_2), ignore.case = TRUE), ]
+
+# Before further processing, make sure we have a data frame. Add a tissue column whose values are the row names
+join_table_3 <- as.data.frame(join_table_3)
+join_table_3$tissue <- rownames(join_table_3) 
+rownames(join_table_3) <- NULL  # Remove row names to avoid redundancy
+join_table_3 <- join_table_3[c("tissue", setdiff(names(join_table_3), c("tissue")))] # Make tissue to be the first column for better readability
+
+# Add a tissue category column, from 'tissue'
+join_table_3$tissue_category <- stringr::str_extract(join_table_3$tissue, pattern)
+
+# Add the species column
+join_table_3$species <- ifelse(grepl("rat", join_table_3$tissue, ignore.case = TRUE), "rat",
+                               ifelse(grepl("mouse", join_table_3$tissue, ignore.case = TRUE), "mouse", "human"))
+
+# Reorder columns for better readability
+join_table_3 <- join_table_3[, c("tissue", "tissue_category", "species", setdiff(names(join_table_3), c("tissue", "tissue_category", "species")))]
+
+saveRDS(join_table_3, file = "join_table_for_clustering.rds")
+
+```
+
+
+Bear in mind that there is not an exact match between the tissues across the different datasets.   
+**pro tip** Do not manually copy from the column names. Convert all column names to lower case, and split them appropriately.    
+
+
+Cluster the tissues using gene expression data. Run k-means and hierarchical clustering. For each algorithm, determine the optimal number of clusters. 
+
+
+```{r}
+######
+
+# Use the table above for clustering and PCA
+# In this case: Run k-means and hierarchical clustering
+library(ggplot2)
+library(dplyr)
+library(ggfortify) # Visualization of the PCA
+
+join_table_3 <- readRDS(file = "join_table_for_clustering.rds")
+
+# Keep only gene expression columns (i.e. remove categorical columns)
+gene_data <- join_table_3 %>%
+  dplyr::select(-c(tissue, tissue_category, species))
+
+# Convert to numeric matrix
+gene_matrix <- as.matrix(gene_data)
+
+# Scale the data (mean = 0, variance = 1)
+gene_matrix <- scale(gene_matrix)
+
+set.seed(100)  # Set seed for reproducibility
+
+## K-MEANS
+
+# Compute within-cluster sum of squares for different k values
+wss <- sapply(1:10, function(k) {
+  kmeans(gene_matrix, centers = k, nstart = 25)$tot.withinss
+})
+
+# Plot Elbow Curve
+plot(1:10, wss, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Clusters (k)", ylab = "Total Within-Cluster Sum of Squares",
+     main = "Elbow Method for choosing k")
+
+# The Elbow Curve flattens around k = 4 or 5, we choose k = 4
+k <- 4
+
+# Run k-means
+kmeans_result <- kmeans(gene_matrix, centers = k, nstart = 25)
+
+# Add cluster labels to the original data
+join_table_3$cluster <- as.factor(kmeans_result$cluster)
+
+# Perform PCA for visualization
+pca_result <- prcomp(gene_matrix)
+
+# Plot clusters in PCA space
+autoplot(pca_result, data = join_table_3, colour = "cluster",
+         label = TRUE, label.size = 3, main = "Tissue Clusters (K-Means)")
+
+# Check tissue distribution by cluster
+table(join_table_3$tissue_category, join_table_3$cluster)
+
+```
+
+```{r}
+## HIERARCHICAL CLUSTERING
+
+# Compute the Euclidean distance between tissues
+distance_matrix <- dist(gene_matrix, method = "euclidean")
+
+# Perform hierarchical clustering using Ward's method
+hc <- hclust(distance_matrix, method = "ward.D2")
+
+# Plot the hierarchical clustering dendrogram
+plot(hc, labels = join_table_3$tissue, main = "Hierarchical Clustering of Tissues", 
+     xlab = "", sub = "", cex = 0.8)
+
+# Choose number of clusters (e.g., 4)
+k <- 4
+clusters <- cutree(hc, k)
+
+# Add cluster labels to the dataset
+join_table_3$cluster <- as.factor(clusters)
+
+# View distribution of tissues in clusters
+table(join_table_3$tissue_category, join_table_3$cluster)
+
+
+
+```
+
+Compare the clustering results using both methodologies, and with the tissues/species. Show the results of the final partitions as a table. 
+
+```{r}
+
+```
+
+Plot a heatmap of the 50 genes with top variance over all samples. Add the information about tissue groups and model (human, rat and mouse) as annotations in the heatmap*. 
+
+```{r}
+
+library(dplyr)
+library(pheatmap)
+
+# Compute variance for each gene (column)
+gene_variances <- apply(gene_matrix, 2, var)
+
+# Select the top 50 genes with the highest variance
+top_genes <- names(sort(gene_variances, decreasing = TRUE))[1:50]
+
+# Subset gene expression data for the top 50 genes
+top_gene_matrix <- gene_matrix[, top_genes]
+
+#### Debugging steps
+str(annotation_col)
+
+# Check if column names of top_gene_matrix match row names of annotation_col
+all(colnames(top_gene_matrix) %in% rownames(annotation_col))
+
+rownames(annotation_col) <- colnames(top_gene_matrix)
+
+
+#### Debugging steps end
+
+# Create annotation data frame
+annotation_col <- data.frame(
+  tissue_category = join_table_3$tissue_category,  # Tissue groups
+  species = join_table_3$species  # Human, Rat, Mouse
+)
+
+# Set row names to match sample names
+rownames(annotation_col) <- rownames(join_table_3)
+
+# Generate heatmap with annotations
+pheatmap(
+  top_gene_matrix,
+  annotation_col = annotation_col,  # Add tissue & species annotations
+  scale = "row",  # Normalize rows (genes) for better visualization
+  clustering_method = "ward.D2",  # Use hierarchical clustering
+  show_rownames = TRUE,  # Show gene names
+  show_colnames = FALSE,  # Hide sample names
+  fontsize_row = 8,  # Adjust font size for better readability
+  main = "Heatmap of Top 50 Most Variable Genes"
+)
+
+
+```
+
+
+
+# Exercise 2: Dimensionality reduction 
+
+## PCA 
+With the gene expression for different tissues and models, perform a PCA on the data and visualize the results (PC1 and PC2, and also, PC3 ). Label the points in the plot with their respective tissues/models. 
+
+```{r}
+data <- readRDS("Data/join_tpm_filtered.rds")
+write.csv(data, "join_tpm_filtered.csv", row.names = TRUE)
+
+```
+
+
+Visualize the data using the PC1 and PC2 again, but this time, color the observations by cluster, using the k means clusters, with k of your choice. Produce a caption for the plot
+
+
+```{r}
+
+```
+
+
+What are the top 50 genes that contribute to the PC1? Are they the same genes that are more variable according to the exercise 1?
+
+
+```{r}
+
+```
+
+## tSNE 
+
+Perform t-SNE on the dataset and visualize the results. Test at least 2 perplexity values.
+
+
+
+```{r}
+
+```
+
+## UMAP
+
+# session info {.unnumbered}
+
+```{r, results='asis',  echo=FALSE, message=FALSE }
+sessionInfo()
+```
