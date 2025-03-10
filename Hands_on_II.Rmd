@@ -1,11 +1,13 @@
 ---
 title: "Hands-on 2 DMI"
-author: "Dummy Surname (dummy@mail.com)"
-date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
+author: "Alexios Giannoulas (alexios.giannoulas01@estudiant.upf.edu)"
+date: 'March 2024'
 output:
   html_document:
     toc: true
     fig_caption: true
+  pdf_document:
+    toc: true
 ---
 
 ```{r setup, include=FALSE}
@@ -21,10 +23,6 @@ Follow the tutorial from the [clustering section](https://genomicsclass.github.i
 
 Install the package [tissuesGeneExpression](https://github.com/genomicsclass/tissuesGeneExpression) by running in R: 
 
-```{r, eval=F}
-library(devtools)
-install_github("genomicsclass/tissuesGeneExpression")
-```
 
 ## Clustering gene expression data in healthy tissues
 
@@ -108,7 +106,7 @@ mouse_gene_mapping <- getBM(
   attributes = c("ensembl_gene_id", "external_gene_name"),
   mart = mouse_mart
 )
-saveRDS(mouse_gene_mapping, file = "mouse_gene_mapping.rds")
+#saveRDS(mouse_gene_mapping, file = "mouse_gene_mapping.rds")
 
 # Remove empty names to avoid issues later on
 mouse_gene_mapping <- mouse_gene_mapping[mouse_gene_mapping$external_gene_name != "", ]
@@ -140,7 +138,7 @@ rat_gene_mapping <- getBM(
   attributes = c("ensembl_gene_id", "external_gene_name"),
   mart = rat_mart
 )
-saveRDS(rat_gene_mapping, file = "rat_gene_mapping.rds")
+#saveRDS(rat_gene_mapping, file = "rat_gene_mapping.rds")
 rat_gene_mapping <- rat_gene_mapping[rat_gene_mapping$external_gene_name != "", ]
 
 # Merge data
@@ -198,7 +196,7 @@ join_table_3$species <- ifelse(grepl("rat", join_table_3$tissue, ignore.case = T
 # Reorder columns for better readability
 join_table_3 <- join_table_3[, c("tissue", "tissue_category", "species", setdiff(names(join_table_3), c("tissue", "tissue_category", "species")))]
 
-saveRDS(join_table_3, file = "join_table_for_clustering.rds")
+#saveRDS(join_table_3, file = "join_table_for_clustering.rds")
 
 ```
 
@@ -211,144 +209,204 @@ Cluster the tissues using gene expression data. Run k-means and hierarchical clu
 
 
 ```{r}
-######
-
-# Use the table above for clustering and PCA
-# In this case: Run k-means and hierarchical clustering
 library(ggplot2)
 library(dplyr)
-library(ggfortify) # Visualization of the PCA
-
+library(ggfortify)
+library(cluster)
+library(caret)
+library(gridExtra)
+library(plotly)
+library(Rtsne)
+library(pheatmap)
+library(umap)
+#Before we do either k-means or hierarchical clustering, we need to preprocess the data. We will start by removing genes with near-zero variance, low expression, #and selecting the top 2000 variable genes by variance. We will then scale the data and perform the clustering.
 join_table_3 <- readRDS(file = "join_table_for_clustering.rds")
-
+#Make 2 annotation vectors for tissue and species
+tissue <- join_table_3$tissue_category
+species <- join_table_3$species
 # Keep only gene expression columns (i.e. remove categorical columns)
 gene_data <- join_table_3 %>%
   dplyr::select(-c(tissue, tissue_category, species))
 
 # Convert to numeric matrix
 gene_matrix <- as.matrix(gene_data)
-
+#Log-transform the data
+gene_matrix <- log2(gene_matrix + 1)
+dim(gene_matrix)  # 14641 genes
+# Check for any near-zero variance features 
+variances <- apply(gene_matrix, 2, var)
+near_zero_variance <- which(variances < 1e-2)  
+#delete columns with near 0 variance
+gene_matrix <- gene_matrix[, -near_zero_variance]
+dim(gene_matrix)  # 14641 genes -> 14258 genes
+#Remove low-expression genes based on mean expression
+gene_means <- colMeans(gene_matrix)
+filtered_matrix <- gene_matrix[, gene_means > 1]
+dim(filtered_matrix) # 14258 genes -> 10115 genes
+# Calculate variance for each gene
+gene_variances <- apply(filtered_matrix, 2, var)
+# Select top 2000 variable genes by variance 
+sorted_variance <- gene_variances[order(-gene_variances)]
+top_genes <- names(sorted_variance)[1:2000]
+# Subset gene expression data for the top 2000 genes
+gene_matrix <- filtered_matrix[, top_genes]
+#There are no near-0 variance features. We continue
 # Scale the data (mean = 0, variance = 1)
 gene_matrix <- scale(gene_matrix)
+rownames(gene_matrix) <- join_table_3$tissue
 
+```
+```{r}
 set.seed(100)  # Set seed for reproducibility
 
 ## K-MEANS
 
-# Compute within-cluster sum of squares for different k values
-wss <- sapply(1:10, function(k) {
-  kmeans(gene_matrix, centers = k, nstart = 25)$tot.withinss
+# We have 13 different tissue types. To give some flexibility on the clustering, including the possibility subclusters could exist within a tissue type, we will try k from 1 to 20
+wss <- sapply(1:20, function(k) {
+  kmeans(gene_matrix, centers = k, nstart = 50, iter.max = 100)$tot.withinss
 })
 
-# Plot Elbow Curve
-plot(1:10, wss, type = "b", pch = 19, frame = FALSE,
-     xlab = "Number of Clusters (k)", ylab = "Total Within-Cluster Sum of Squares",
-     main = "Elbow Method for choosing k")
-
-# The Elbow Curve flattens around k = 4 or 5, we choose k = 4
-k <- 4
-
-# Run k-means
-kmeans_result <- kmeans(gene_matrix, centers = k, nstart = 25)
+plot(1:20, wss, type = "b", xlab = "Number of Clusters", ylab = "Within-Cluster Sum of Squares", main = "Elbow Method for choosing k")
+```
+```{r}
+#Use the Silhouette method to determine the optimal number of clusters for tissue clustering
+sil <- sapply(2:20, function(k) {
+  kmeans_result <- kmeans(gene_matrix, centers = k, nstart = 50, iter.max = 100)
+  mean(silhouette(kmeans_result$cluster, dist(gene_matrix))[, 3])
+})
+plot(2:20, sil, type = "b", xlab = "Number of Clusters", ylab = "Average Silhouette Width")
+```
+```{r}
+# We can see that for k=2 (first point in plot) and k=3 there are high silhouette widths. On a first look this makes sense because if we compare the human transcriptome with the ones of the mouse and the rat, human would cluster seperately from the other 2 species which explains k=2 but since k=3 has also high silhouette width, this means that the mouse and rat transcriptomes are different enough to be clustered separately as well. 
+#For tissue type clustering we get high scores for 17 and 19 clusters. We choose 17 
+# Run k-means with 17 clusters
+kmeans_result <- kmeans(gene_matrix, centers = 17, nstart = 25)
 
 # Add cluster labels to the original data
 join_table_3$cluster <- as.factor(kmeans_result$cluster)
 
-# Perform PCA for visualization
-pca_result <- prcomp(gene_matrix)
 
-# Plot clusters in PCA space
-autoplot(pca_result, data = join_table_3, colour = "cluster",
-         label = TRUE, label.size = 3, main = "Tissue Clusters (K-Means)")
+# Set colors for tissue types
+colorblind_colors <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", 
+                       "#D55E00", "#CC79A7", "#999999", "#660099", "#009999", 
+                       "#666600", "#FF33CC", "#33CCFF") 
+tissue_levels <- unique(tissue)  # Get unique tissue types
+tissue_colors <- setNames(colorblind_colors[1:length(tissue_levels)], tissue_levels)
+#Set colors for species
+species_colors <- c("rat" = "#0072B2", "mouse" = "#D55E00", "human" = "#009E73")
+species_levels <- unique(species)
+species_colors <- setNames(species_colors[1:length(species_levels)], species_levels)
 
-# Check tissue distribution by cluster
-table(join_table_3$tissue_category, join_table_3$cluster)
+
+```
+
+
+
+
+```{r}
+# Plot the distribution of tissue types in each cluster
+tissue_clusters <- ggplot(join_table_3, aes(x = cluster, fill = tissue_category)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = tissue_colors) + 
+  labs(title = "Tissue Distribution by Cluster (K-Means)", x = "Cluster", y = "Proportion") +
+  theme_minimal() 
+tissue_clusters
 
 ```
 
 ```{r}
 ## HIERARCHICAL CLUSTERING
-
-# Compute the Euclidean distance between tissues
-distance_matrix <- dist(gene_matrix, method = "euclidean")
-
-# Perform hierarchical clustering using Ward's method
-hc <- hclust(distance_matrix, method = "ward.D2")
-
-# Plot the hierarchical clustering dendrogram
-plot(hc, labels = join_table_3$tissue, main = "Hierarchical Clustering of Tissues", 
-     xlab = "", sub = "", cex = 0.8)
-
-# Choose number of clusters (e.g., 4)
-k <- 4
-clusters <- cutree(hc, k)
-
-# Add cluster labels to the dataset
-join_table_3$cluster <- as.factor(clusters)
-
-# View distribution of tissues in clusters
-table(join_table_3$tissue_category, join_table_3$cluster)
-
-
-
+library(rafalib)
+mypar()
+# Compute the Euclidean distance between samples for hierarchical clustering
+distance_matrix <- dist(gene_matrix)
+# Perform hierarchical clustering using the calculated distance matrix
+hc <- hclust(distance_matrix)
+```
+```{r}
+# Visualize the hierarchical clustering dendrogram with tissue labels 
+myplclust(hc, 
+          labels = tissue, 
+          lab.col = tissue_colors[tissue],  
+          cex = 0.5, 
+          main = "Hierarchical Clustering of Tissues")
+# Add a horizontal line at height = 45 to visually cut the tree into clusters
+abline(h = 40, col = "red") 
+```
+```{r}
+# Cut the dendrogram into clusters based on the height threshold (h = 45)
+hclusters <- cutree(hc, h=40)
+# Create a table to check the distribution of tissues across hierarchical clusters
+table(true=tissue, cluster=hclusters)
+# Add cluster labels to the original dataset
+join_table_3$cluster_hc <- as.factor(hclusters)
+# Perform PCA for visualization
+pca_result <- prcomp(gene_matrix)
+# Plot clusters in PCA space
+PCA_HC <- autoplot(pca_result, data = join_table_3, colour = "cluster_hc",
+         label = FALSE, label.size = 3, main = "Tissue Clusters (Hierarchical Clustering)") +
+  theme_minimal() + 
+  theme(panel.background = element_rect(fill = "white", colour = "black"),
+        plot.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(colour = "gray90"),  
+        panel.grid.minor = element_blank())
+PCA_HC
 ```
 
-Compare the clustering results using both methodologies, and with the tissues/species. Show the results of the final partitions as a table. 
+
 
 ```{r}
+# Check how tissue types are distributed across the hierarchical clusters
+table(join_table_3$tissue_category, join_table_3$cluster_hc)
+# Plot the proportion of tissue types in each hierarchical cluster to understand the clustering result
+tissue_clusters_HC <- ggplot(join_table_3, aes(x = cluster_hc, fill = tissue_category)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = tissue_colors) +  # Explicitly set colors
+  labs(title = "Tissue Distribution by Cluster HC", x = "Cluster", y = "Proportion") +
+  theme_minimal()
+tissue_clusters_HC
+```
 
+
+
+Compare the clustering results using both methodologies, and with the tissues/species. Show the results of the final partitions as a table. 
+```{r fig.width=12, fig.height=6}
+# Combine the k-means and hierarchical clustering distribution plots for side-by-side comparison
+grid.arrange(tissue_clusters, tissue_clusters_HC, ncol = 2)
+```
+```{r}
+# Check tissue distribution by cluster
+kmeans_partition <- table(join_table_3$tissue_category, join_table_3$cluster)
+hc_partition <- table(join_table_3$tissue_category, join_table_3$cluster_hc)
+kmeans_partition
+hc_partition
 ```
 
 Plot a heatmap of the 50 genes with top variance over all samples. Add the information about tissue groups and model (human, rat and mouse) as annotations in the heatmap*. 
-
 ```{r}
-
-library(dplyr)
-library(pheatmap)
-
-# Compute variance for each gene (column)
-gene_variances <- apply(gene_matrix, 2, var)
-
-# Select the top 50 genes with the highest variance
-top_genes <- names(sort(gene_variances, decreasing = TRUE))[1:50]
-
-# Subset gene expression data for the top 50 genes
-top_gene_matrix <- gene_matrix[, top_genes]
-
-#### Debugging steps
-str(annotation_col)
-
-# Check if column names of top_gene_matrix match row names of annotation_col
-all(colnames(top_gene_matrix) %in% rownames(annotation_col))
-
-rownames(annotation_col) <- colnames(top_gene_matrix)
-
-
-#### Debugging steps end
-
-# Create annotation data frame
-annotation_col <- data.frame(
-  tissue_category = join_table_3$tissue_category,  # Tissue groups
-  species = join_table_3$species  # Human, Rat, Mouse
-)
-
-# Set row names to match sample names
-rownames(annotation_col) <- rownames(join_table_3)
-
-# Generate heatmap with annotations
-pheatmap(
-  top_gene_matrix,
-  annotation_col = annotation_col,  # Add tissue & species annotations
-  scale = "row",  # Normalize rows (genes) for better visualization
-  clustering_method = "ward.D2",  # Use hierarchical clustering
-  show_rownames = TRUE,  # Show gene names
-  show_colnames = FALSE,  # Hide sample names
-  fontsize_row = 8,  # Adjust font size for better readability
-  main = "Heatmap of Top 50 Most Variable Genes"
-)
+# Get the top 50 genes with the highest variance
+top50_genes <- names(sorted_variance)[1:50]
+# Subset the gene matrix for the top 50 genes
+top50_matrix <- gene_matrix[, top50_genes]
+top50_matrix <- t(top50_matrix)
+#Create dataframe for annotation 
+annotation_frame <- join_table_3[, c("tissue_category", "species")]
+rownames(annotation_frame) <- join_table_3$tissue
+```
+```{r fig.width=18, fig.height=12}
+#Plot a heatmap of the top 50 genes with the highest variance. Add tissue and species annotations. Have genes on the rows and samples on the columns
+color_palette <- colorRampPalette(c("#FF7F0E", "white", "#1F77B4"))(100)
+breaks <- c(seq(min(top50_matrix), 0, length.out = 51), seq(0 + .Machine$double.eps, max(top50_matrix), length.out = 50))
+pheatmap(top50_matrix, 
+         annotation_col = annotation_frame[, c("tissue_category", "species")],
+         annotation_colors = list(tissue_category = tissue_colors, species = species_colors),
+         color = color_palette,
+         main = "Top 50 Genes with Highest Variance",
+         breaks = breaks)
 
 
 ```
+
 
 
 
@@ -358,15 +416,81 @@ pheatmap(
 With the gene expression for different tissues and models, perform a PCA on the data and visualize the results (PC1 and PC2, and also, PC3 ). Label the points in the plot with their respective tissues/models. 
 
 ```{r}
+#We already run PCA for HC so we use the PCA result from the previous exercise
+#color by tissue_category
+PCA_tiss <- autoplot(pca_result, data = join_table_3, colour = "tissue_category",
+         label = FALSE, label.size = 3, main = "PCA colored by tissue type") +
+  theme_minimal() + 
+  theme(panel.background = element_rect(fill = "white", colour = "black"),
+        plot.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(colour = "gray90"),  
+        panel.grid.minor = element_blank())
+PCA_tiss
+```
+```{r}
+# Create a 3D PCA plot with PC1, PC2, and PC3
+pca_data <- data.frame(pca_result$x)
 
+# Create a 3D scatter plot for PC1, PC2, and PC3
+pca_3d <- plot_ly(data = pca_data, 
+                  x = ~PC1, 
+                  y = ~PC2, 
+                  z = ~PC3, 
+                  color = join_table_3$tissue_category,  # Color points by tissue category
+                  text = join_table_3$tissue_category,  # Show tissue/category in the hover label
+                  type = "scatter3d", 
+                  mode = "markers") %>%
+  layout(title = "3D PCA colored by tissue type", 
+         scene = list(xaxis = list(title = 'PC1'),
+                      yaxis = list(title = 'PC2'),
+                      zaxis = list(title = 'PC3')))
+pca_3d
 ```
 
-
+```{r}
+#Color by species
+PCA_species <- autoplot(pca_result, data = join_table_3, colour = "species",
+         label = FALSE, label.size = 3, main = "PCA colored by species") +
+  theme_minimal() + 
+  theme(panel.background = element_rect(fill = "white", colour = "black"),
+        plot.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(colour = "gray90"),  
+        panel.grid.minor = element_blank())
+PCA_species
+```
+```{r}
+#Create a 3D scatter plot for PC1, PC2, and PC3 colored by species
+pca_3d_species <- plot_ly(data = pca_data, 
+                  x = ~PC1, 
+                  y = ~PC2, 
+                  z = ~PC3, 
+                  color = join_table_3$species,  # Color points by species
+                  text = join_table_3$species,  # Show species in the hover label
+                  type = "scatter3d", 
+                  mode = "markers") %>%
+  layout(title = "3D PCA colored by species", 
+         scene = list(xaxis = list(title = 'PC1'),
+                      yaxis = list(title = 'PC2'),
+                      zaxis = list(title = 'PC3')))
+pca_3d_species
+```
 Visualize the data using the PC1 and PC2 again, but this time, color the observations by cluster, using the k means clusters, with k of your choice. Produce a caption for the plot
 
 
 ```{r}
-
+# Plot clusters in PCA space
+PCA_kmeans <- autoplot(pca_result, data = join_table_3, colour = "cluster",
+         label = FALSE, label.size = 3, main = "PCA colored by k-means cluster") +
+  theme_minimal() + 
+  theme(panel.background = element_rect(fill = "white", colour = "black"),
+        plot.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(colour = "gray90"),  
+        panel.grid.minor = element_blank())
+PCA_kmeans
+```
+```{r fig.width=12, fig.height=6}
+#Combine the different PCA visualisations
+grid.arrange(PCA_species, PCA_tiss, ncol = 2)
 ```
 
 
@@ -374,21 +498,111 @@ What are the top 50 genes that contribute to the PC1? Are they the same genes th
 
 
 ```{r}
-
+# Get the top 50 genes contributing to PC1
+top_genes_pc1 <- pca_result$rotation[, 1] %>% sort(decreasing = TRUE) %>% names() %>% head(50)
+#Get the top 50 genes with the highest variance
+top_genes_variance <- names(sort(gene_variances, decreasing = TRUE))[1:50]
+#How similar are the two lists?
+sum(top_genes_pc1 %in% top_genes_variance)  # 50
+#Only 10 genes are in common between the two lists. This is expected since the top 50 genes contributing to PC1 are not necessarily the top 50 most variable genes,
+#because PCA is focused on capturing global patterns in the data, and not just variability.
 ```
 
 ## tSNE 
 
 Perform t-SNE on the dataset and visualize the results. Test at least 2 perplexity values.
 
-
-
 ```{r}
+#t-SNE on gene_matrix
+set.seed(100)  # Set seed for reproducibility
+tsne_result <- Rtsne(gene_matrix, perplexity = 30, check_duplicates = FALSE)
+# Create a data frame for the t-SNE results
+tsne_data <- data.frame(tsne_result$Y)
+colnames(tsne_data) <- c("tSNE1", "tSNE2")
+tsne_data$tissue <- join_table_3$tissue_category
+tsne_data$species <- join_table_3$species
+# Plot t-SNE results colored by tissue type white
+tsne_tissue <- ggplot(tsne_data, aes(x = tSNE1, y = tSNE2, color = tissue)) +
+  geom_point() +
+  scale_color_manual(values = tissue_colors) +
+  labs(title = "t-SNE colored by tissue type (p = 30)") +
+  theme_minimal()
+tsne_tissue
 
+```
+```{r}
+## Plot t-SNE results colored by species
+tsne_species <- ggplot(tsne_data, aes(x = tSNE1, y = tSNE2, color = species)) +
+  geom_point() +
+  scale_color_manual(values = species_colors) +
+  labs(title = "t-SNE colored by species (p = 30)") +
+  theme_minimal()
+tsne_species
+```
+```{r fig.width=12, fig.height=6}
+# Plot the 2 together
+grid.arrange(tsne_tissue, tsne_species, ncol = 2)
+```
+```{r}
+#t-SNE with perplexity 20
+set.seed(100)  # Set seed for reproducibility
+tsne_result_20 <- Rtsne(gene_matrix, perplexity = 20, check_duplicates = FALSE)
+# Create a data frame for the t-SNE results
+tsne_data_20 <- data.frame(tsne_result_20$Y)
+colnames(tsne_data_20) <- c("tSNE1", "tSNE2")
+tsne_data_20$tissue <- join_table_3$tissue_category
+tsne_data_20$species <- join_table_3$species
+# Plot t-SNE results colored by tissue type white
+tsne_tissue_20 <- ggplot(tsne_data_20, aes(x = tSNE1, y = tSNE2, color = tissue)) +
+  geom_point() +
+  scale_color_manual(values = tissue_colors) +
+  labs(title = "t-SNE colored by tissue type (p = 20)") +
+  theme_minimal()
+tsne_tissue_20
+```
+```{r}
+## Plot t-SNE results colored by species
+tsne_species_20 <- ggplot(tsne_data_20, aes(x = tSNE1, y = tSNE2, color = species)) +
+  geom_point() +
+  scale_color_manual(values = species_colors) +
+  labs(title = "t-SNE colored by species (p = 20)") +
+  theme_minimal()
+tsne_species_20
+```
+```{r fig.width=12, fig.height=9}
+#Plot perplexity 20 and 30 together for all 4 plots
+grid.arrange(tsne_tissue_20, tsne_tissue, tsne_species_20, tsne_species,   ncol = 2)
 ```
 
 ## UMAP
+```{r}
+#Apply UMAP on scaled matrix gene_matrix
+umap_result <- umap(gene_matrix)
+umap_data <- as.data.frame(umap_result$layout)
+colnames(umap_data) <- c("UMAP1", "UMAP2")
+umap_data$tissue <- join_table_3$tissue_category
+umap_data$species <- join_table_3$species
+```
+```{r}
+umap_tissue <- ggplot(umap_data, aes(x = UMAP1, y = UMAP2, color = tissue)) +
+  geom_point() +
+  scale_color_manual(values = tissue_colors) +
+  labs(title = "UMAP colored by tissue type") +
+  theme_minimal()
 
+umap_tissue
+```
+```{r}
+umap_species <- ggplot(umap_data, aes(x = UMAP1, y = UMAP2, color = species)) +
+  geom_point() +
+  scale_color_manual(values = species_colors) +
+  labs(title = "UMAP colored by species") +
+  theme_minimal()
+umap_species
+```
+```{r fig.width=12, fig.height=6}
+grid.arrange(umap_tissue, umap_species, ncol = 2)
+```
 # session info {.unnumbered}
 
 ```{r, results='asis',  echo=FALSE, message=FALSE }
