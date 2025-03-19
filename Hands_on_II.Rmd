@@ -219,8 +219,11 @@ library(plotly)
 library(Rtsne)
 library(pheatmap)
 library(umap)
-#Before we do either k-means or hierarchical clustering, we need to preprocess the data. We will start by removing genes with near-zero variance, low expression, #and selecting the top 2000 variable genes by variance. We will then scale the data and perform the clustering.
-join_table_3 <- readRDS(file = "join_table_for_clustering.rds")
+###To start from this part without running the previous steps run this command
+#join_table_3 <- readRDS(file = "join_table_for_clustering.rds")
+
+#Before we do either k-means or hierarchical clustering, we need to preprocess the data. We will start by removing genes with near-zero variance, low expression, and selecting the top 2000 variable genes by variance. We will then scale the data and perform the clustering.
+
 #Make 2 annotation vectors for tissue and species
 tissue <- join_table_3$tissue_category
 species <- join_table_3$species
@@ -230,27 +233,26 @@ gene_data <- join_table_3 %>%
 
 # Convert to numeric matrix
 gene_matrix <- as.matrix(gene_data)
-#Log-transform the data
+# Apply log2 transformation to normalize gene expression values
 gene_matrix <- log2(gene_matrix + 1)
 dim(gene_matrix)  # 14641 genes
-# Check for any near-zero variance features 
+# Identify and remove genes with near-zero variance
 variances <- apply(gene_matrix, 2, var)
 near_zero_variance <- which(variances < 1e-2)  
 #delete columns with near 0 variance
 gene_matrix <- gene_matrix[, -near_zero_variance]
 dim(gene_matrix)  # 14641 genes -> 14258 genes
-#Remove low-expression genes based on mean expression
+#Remove low-expression genes based on mean expression threshold
 gene_means <- colMeans(gene_matrix)
 filtered_matrix <- gene_matrix[, gene_means > 1]
 dim(filtered_matrix) # 14258 genes -> 10115 genes
 # Calculate variance for each gene
 gene_variances <- apply(filtered_matrix, 2, var)
-# Select top 2000 variable genes by variance 
+# Select top 2000 variable genes 
 sorted_variance <- gene_variances[order(-gene_variances)]
 top_genes <- names(sorted_variance)[1:2000]
 # Subset gene expression data for the top 2000 genes
 gene_matrix <- filtered_matrix[, top_genes]
-#There are no near-0 variance features. We continue
 # Scale the data (mean = 0, variance = 1)
 gene_matrix <- scale(gene_matrix)
 rownames(gene_matrix) <- join_table_3$tissue
@@ -276,6 +278,7 @@ sil <- sapply(2:20, function(k) {
 })
 plot(2:20, sil, type = "b", xlab = "Number of Clusters", ylab = "Average Silhouette Width")
 ```
+
 ```{r}
 # We can see that for k=2 (first point in plot) and k=3 there are high silhouette widths. On a first look this makes sense because if we compare the human transcriptome with the ones of the mouse and the rat, human would cluster seperately from the other 2 species which explains k=2 but since k=3 has also high silhouette width, this means that the mouse and rat transcriptomes are different enough to be clustered separately as well. 
 #For tissue type clustering we get high scores for 17 and 19 clusters. We choose 17 
@@ -304,7 +307,7 @@ species_colors <- setNames(species_colors[1:length(species_levels)], species_lev
 
 
 ```{r}
-# Plot the distribution of tissue types in each cluster
+# Visualize the distribution of tissue types in each cluster
 tissue_clusters <- ggplot(join_table_3, aes(x = cluster, fill = tissue_category)) +
   geom_bar(position = "fill") +
   scale_fill_manual(values = tissue_colors) + 
@@ -324,7 +327,7 @@ distance_matrix <- dist(gene_matrix)
 hc <- hclust(distance_matrix)
 ```
 ```{r}
-# Visualize the hierarchical clustering dendrogram with tissue labels 
+#Visualize hierarchical clustering results
 myplclust(hc, 
           labels = tissue, 
           lab.col = tissue_colors[tissue],  
@@ -334,7 +337,7 @@ myplclust(hc,
 abline(h = 40, col = "red") 
 ```
 ```{r}
-# Cut the dendrogram into clusters based on the height threshold (h = 45)
+# Assign hierarchical clusters based on tree cutting
 hclusters <- cutree(hc, h=40)
 # Create a table to check the distribution of tissues across hierarchical clusters
 table(true=tissue, cluster=hclusters)
@@ -342,7 +345,7 @@ table(true=tissue, cluster=hclusters)
 join_table_3$cluster_hc <- as.factor(hclusters)
 # Perform PCA for visualization
 pca_result <- prcomp(gene_matrix)
-# Plot clusters in PCA space
+# Plot PCA colored by hierarchical clusters
 PCA_HC <- autoplot(pca_result, data = join_table_3, colour = "cluster_hc",
          label = FALSE, label.size = 3, main = "Tissue Clusters (Hierarchical Clustering)") +
   theme_minimal() + 
@@ -371,11 +374,11 @@ tissue_clusters_HC
 
 Compare the clustering results using both methodologies, and with the tissues/species. Show the results of the final partitions as a table. 
 ```{r fig.width=12, fig.height=6}
-# Combine the k-means and hierarchical clustering distribution plots for side-by-side comparison
+# Compare the clustering results using k-means and hierarchical clustering
 grid.arrange(tissue_clusters, tissue_clusters_HC, ncol = 2)
 ```
 ```{r}
-# Check tissue distribution by cluster
+# Compute contingency tables for cluster assignments
 kmeans_partition <- table(join_table_3$tissue_category, join_table_3$cluster)
 hc_partition <- table(join_table_3$tissue_category, join_table_3$cluster_hc)
 kmeans_partition
@@ -394,7 +397,7 @@ annotation_frame <- join_table_3[, c("tissue_category", "species")]
 rownames(annotation_frame) <- join_table_3$tissue
 ```
 ```{r fig.width=18, fig.height=12}
-#Plot a heatmap of the top 50 genes with the highest variance. Add tissue and species annotations. Have genes on the rows and samples on the columns
+#Generate heatmap with tissue and species annotations
 color_palette <- colorRampPalette(c("#FF7F0E", "white", "#1F77B4"))(100)
 breaks <- c(seq(min(top50_matrix), 0, length.out = 51), seq(0 + .Machine$double.eps, max(top50_matrix), length.out = 50))
 pheatmap(top50_matrix, 
@@ -417,7 +420,7 @@ With the gene expression for different tissues and models, perform a PCA on the 
 
 ```{r}
 #We already run PCA for HC so we use the PCA result from the previous exercise
-#color by tissue_category
+#Perform dimensionality reduction using PCA, labeling by tissue type
 PCA_tiss <- autoplot(pca_result, data = join_table_3, colour = "tissue_category",
          label = FALSE, label.size = 3, main = "PCA colored by tissue type") +
   theme_minimal() + 
@@ -428,10 +431,8 @@ PCA_tiss <- autoplot(pca_result, data = join_table_3, colour = "tissue_category"
 PCA_tiss
 ```
 ```{r}
-# Create a 3D PCA plot with PC1, PC2, and PC3
-pca_data <- data.frame(pca_result$x)
-
 # Create a 3D scatter plot for PC1, PC2, and PC3
+pca_data <- data.frame(pca_result$x)
 pca_3d <- plot_ly(data = pca_data, 
                   x = ~PC1, 
                   y = ~PC2, 
@@ -464,8 +465,8 @@ pca_3d_species <- plot_ly(data = pca_data,
                   x = ~PC1, 
                   y = ~PC2, 
                   z = ~PC3, 
-                  color = join_table_3$species,  # Color points by species
-                  text = join_table_3$species,  # Show species in the hover label
+                  color = join_table_3$species,  
+                  text = join_table_3$species,  
                   type = "scatter3d", 
                   mode = "markers") %>%
   layout(title = "3D PCA colored by species", 
@@ -489,7 +490,7 @@ PCA_kmeans <- autoplot(pca_result, data = join_table_3, colour = "cluster",
 PCA_kmeans
 ```
 ```{r fig.width=12, fig.height=6}
-#Combine the different PCA visualisations
+#Show PCA results colored by tissue and species side by side
 grid.arrange(PCA_species, PCA_tiss, ncol = 2)
 ```
 
